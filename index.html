@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="ur">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notes Converter</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1f4d3a">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Naskh+Arabic:wght@400;700&family=Noto+Nastaliq+Urdu&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<style>
+:root{--bg:#f6f4ee;--ink:#1d2a24;--green:#1f4d3a;--line:#d8d3c4;--gold:#b8892b;--card:#fff}
+*{box-sizing:border-box}
+body{margin:0;font:16px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--ink);padding:14px;max-width:720px;margin:auto}
+h1{font-size:22px;margin:6px 0 14px;color:var(--green)}
+details,.box{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:12px}
+summary{font-weight:600}
+label{display:block;font-size:14px;margin:8px 0 3px}
+input[type=text],input[type=password]{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;font-size:15px}
+button{background:var(--green);color:#fff;border:0;border-radius:8px;padding:11px 16px;font-size:15px;margin:6px 6px 0 0}
+button.alt{background:var(--gold)}
+button:disabled{opacity:.5}
+#status{font-size:14px;margin:8px 0;white-space:pre-wrap}
+.line{border-bottom:1px solid var(--line);padding:8px 0}
+.line textarea{width:100%;border:1px solid var(--line);border-radius:6px;padding:8px;font-size:18px;min-height:44px;resize:vertical}
+.line textarea.rtl{direction:rtl;font-family:'Noto Naskh Arabic',serif;font-size:22px}
+.tag{font-size:12px;color:#fff;background:var(--gold);padding:2px 8px;border-radius:10px;display:inline-block;margin-bottom:4px}
+.pg{font-weight:700;color:var(--green);margin:14px 0 2px}
+</style>
+</head>
+<body>
+<h1>Handwritten Notes → Word / Excel</h1>
+
+<details open>
+<summary>Settings</summary>
+<label>Mode</label>
+<select id="mode" style="width:100%;padding:10px;border-radius:8px"><option value="offline">Offline (bina API key, kam accuracy)</option><option value="ai">AI - Gemini (behtar handwriting)</option></select>
+<label>Gemini API key (sirf AI mode) (aistudio.google.com/apikey)</label>
+<input type="password" id="key" placeholder="AIza...">
+<label>Model</label>
+<input type="text" id="model" value="gemini-2.5-flash">
+</details>
+
+<div class="box">
+<input type="file" id="file" accept="application/pdf">
+<br><button id="go">Convert</button>
+<div id="status"></div>
+</div>
+
+<div id="out"></div>
+<div id="dl" style="display:none">
+<button id="doc">Download Word</button>
+<button id="xls" class="alt">Download Excel</button>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+const $=id=>document.getElementById(id);
+const st=t=>$('status').textContent=t;
+$('key').value=localStorage.getItem('gkey')||'';
+$('mode').value=localStorage.getItem('gmode')||'offline';
+$('model').value=localStorage.getItem('gmodel')||$('model').value;
+
+// ---------- Quran ----------
+const norm=s=>s.replace(/[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u0640\u200c\u200d]/g,'')
+ .replace(/[أإآٱ]/g,'ا').replace(/[ىیېئ]/g,'ي').replace(/ک/g,'ك').replace(/[ةہھۃ]/g,'ه')
+ .replace(/[^\u0621-\u064A]/g,'');
+let Q=null;
+async function loadQuran(){
+  if(Q)return Q;
+  let raw=null;
+  try{raw=localStorage.getItem('quran_v1')}catch(e){}
+  if(!raw){
+    st('Quran text download ho raha hai (sirf pehli baar)...');
+    const r=await fetch('https://api.alquran.cloud/v1/quran/quran-uthmani');
+    const j=await r.json();
+    const arr=[];
+    j.data.surahs.forEach(s=>s.ayahs.forEach(a=>{
+      let t=a.text;
+      if(s.number!==1&&a.numberInSurah===1)t=t.replace(/^بِسْمِ ٱللَّهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ\s*/,'');
+      arr.push([s.englishName,s.number,a.numberInSurah,t]);
+    }));
+    raw=JSON.stringify(arr);
+    try{localStorage.setItem('quran_v1',raw)}catch(e){}
+  }
+  Q=JSON.parse(raw).map(v=>({name:v[0],s:v[1],a:v[2],text:v[3],n:norm(v[3])}));
+  return Q;
+}
+function bigrams(s){const m=new Map();for(let i=0;i<s.length-1;i++){const b=s.substr(i,2);m.set(b,(m.get(b)||0)+1)}return m}
+function dice(a,b){let o=0;for(const[k,v]of a){if(b.has(k))o+=Math.min(v,b.get(k))}
+ const la=[...a.values()].reduce((x,y)=>x+y,0),lb=[...b.values()].reduce((x,y)=>x+y,0);return 2*o/(la+lb||1)}
+function matchVerse(text,flagged){
+  const n=norm(text);
+  if(n.length<6)return null;
+  for(const v of Q){if(v.n.includes(n)||(v.n.length>12&&n.includes(v.n)))return v}
+  if(!flagged)return null;
+  const bg=bigrams(n);let best=null,bs=0;
+  for(const v of Q){if(Math.abs(v.n.length-n.length)>n.length*0.6)continue;
+    const d=dice(bg,bigrams(v.n));if(d>bs){bs=d;best=v}}
+  return bs>=0.7?best:null;
+}
+
+// ---------- AI ----------
+const PROMPT=`This is a page of handwritten notes in English and/or Urdu, possibly with Quranic verses (Arabic).
+Transcribe EVERY line exactly in reading order. Return ONLY a JSON array. Each item: {"text":"...","lang":"en"|"ur"|"ar","quran":true|false}.
+Use lang "ar" and quran true for Quranic verses. Keep Urdu in Urdu script. Do not translate. Do not skip anything.`;
+async function readOffline(canvas){
+  const r=await Tesseract.recognize(canvas,'urd+eng',{logger:m=>{if(m.status==='recognizing text')st('Padh raha hai '+Math.round(m.progress*100)+'%')}});
+  return r.data.lines.map(l=>l.text.trim()).filter(Boolean).map(t=>{
+    const ar=/[\u0600-\u06FF]/.test(t);return{text:t,lang:ar?'ur':'en',quran:ar}});
+}
+async function readPage(b64,canvas){
+  if($('mode').value==='offline')return readOffline(canvas);
+  const key=$('key').value.trim(),model=$('model').value.trim();
+  const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({contents:[{parts:[{text:PROMPT},{inline_data:{mime_type:'image/jpeg',data:b64}}]}],
+      generationConfig:{responseMimeType:'application/json',temperature:0}})});
+  const j=await r.json();
+  if(!r.ok)throw new Error(j.error?.message||'API error');
+  return JSON.parse(j.candidates[0].content.parts[0].text);
+}
+
+// ---------- Main ----------
+let pages=[];
+$('go').onclick=async()=>{
+  const f=$('file').files[0];
+  if(!f)return st('Pehle PDF chuniye.');
+  if($('mode').value==='ai'&&!$('key').value.trim())return st('API key daaliye.');
+  localStorage.setItem('gmode',$('mode').value);
+  localStorage.setItem('gkey',$('key').value.trim());
+  localStorage.setItem('gmodel',$('model').value.trim());
+  $('go').disabled=true;$('out').innerHTML='';$('dl').style.display='none';pages=[];
+  try{
+    await loadQuran();
+    const pdf=await pdfjsLib.getDocument({data:await f.arrayBuffer()}).promise;
+    for(let p=1;p<=pdf.numPages;p++){
+      st(`Page ${p} / ${pdf.numPages} padha ja raha hai...`);
+      const pg=await pdf.getPage(p);
+      const vp=pg.getViewport({scale:1.8});
+      const c=document.createElement('canvas');c.width=vp.width;c.height=vp.height;
+      await pg.render({canvasContext:c.getContext('2d'),viewport:vp}).promise;
+      const b64=c.toDataURL('image/jpeg',0.85).split(',')[1];
+      let lines=await readPage(b64,c);
+      lines=lines.map(l=>{
+        const m=(l.lang!=='en')?matchVerse(l.text,l.quran):null;
+        return m?{text:m.text,lang:'ar',verse:true,ref:`${m.name} ${m.s}:${m.a}`}:{text:l.text,lang:l.lang,verse:false,ref:''};
+      });
+      pages.push(lines);render();
+    }
+    st('Ho gaya. Zaroorat ho to text edit karein, phir download.');
+    $('dl').style.display='block';
+  }catch(e){st('Error: '+e.message)}
+  $('go').disabled=false;
+};
+
+function render(){
+  const o=$('out');o.innerHTML='';
+  pages.forEach((lines,pi)=>{
+    const h=document.createElement('div');h.className='pg';h.textContent='Page '+(pi+1);o.appendChild(h);
+    lines.forEach((l,li)=>{
+      const d=document.createElement('div');d.className='line';
+      if(l.verse){const t=document.createElement('span');t.className='tag';t.textContent='Quran '+l.ref;d.appendChild(t)}
+      const ta=document.createElement('textarea');ta.value=l.text;
+      if(l.lang!=='en')ta.className='rtl';ta.dir=l.lang==='en'?'ltr':'rtl';
+      ta.oninput=()=>{l.text=ta.value};
+      d.appendChild(ta);o.appendChild(d);
+    });
+  });
+}
+
+function save(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click()}
+const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+$('doc').onclick=()=>{
+  let h='<html xmlns:w="urn:schemas-microsoft-com:office:word"><head><meta charset="utf-8"><style>body{font-family:Calibri}.r{direction:rtl;text-align:right;font-family:"Noto Naskh Arabic","Traditional Arabic",serif;font-size:18pt}.q{color:#1f4d3a;font-size:20pt}.ref{color:#888;font-size:9pt;direction:ltr}</style></head><body>';
+  pages.forEach((lines,i)=>{
+    h+=`<h3>Page ${i+1}</h3>`;
+    lines.forEach(l=>{
+      if(l.lang==='en')h+=`<p>${esc(l.text)}</p>`;
+      else h+=`<p class="r ${l.verse?'q':''}" dir="rtl">${esc(l.text)}</p>`+(l.verse?`<p class="ref">[${l.ref}]</p>`:'');
+    });
+  });
+  save(new Blob(['\ufeff'+h+'</body></html>'],{type:'application/msword'}),'notes.doc');
+};
+
+$('xls').onclick=()=>{
+  const rows=[['Page','Line','Language','Text','Quran Reference']];
+  pages.forEach((lines,i)=>lines.forEach((l,j)=>rows.push([i+1,j+1,l.lang,l.text,l.ref])));
+  const ws=XLSX.utils.aoa_to_sheet(rows);ws['!cols']=[{wch:6},{wch:6},{wch:9},{wch:70},{wch:22}];
+  const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Notes');
+  XLSX.writeFile(wb,'notes.xlsx');
+};
+</script>
+</body>
+</html>
